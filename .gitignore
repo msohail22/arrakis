@@ -1,0 +1,9 @@
+
+# OpenTofu
+tofu/.terraform/
+tofu/.terraform.lock.hcl.bak
+tofu/*.tfstate
+tofu/*.tfstate.*
+tofu/terraform.tfvars
+tofu/*.tfvars.json
+crash.log

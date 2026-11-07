@@ -1,0 +1,198 @@
+# Network: arrakis
+
+Measured 2026-11-08. All facts here come from the live machine.
+
+## 1. What already exists
+
+Wi-Fi works. Nothing needs an install.
+
+```
+Manager      ifupdown (networking.service) + wpa_supplicant.service
+             NetworkManager is NOT installed. systemd-networkd is disabled.
+Config       /etc/network/interfaces      (mode 0600, root only)
+Interface    wlp3s0   UP   192.168.1.21/24
+Gateway      192.168.1.1
+SSID         Airtel_aksh_6013   5 GHz (5805 MHz)   signal -68 dBm
+Ethernet     enp2s0   DOWN   (a port exists, no cable)
+Tailscale    tailscale0   100.114.18.44
+Docker       docker0   172.17.0.1/16   DOWN (no containers)
+ip_forward   already 1   (Docker set it)
+```
+
+This combination is lucky. Proxmox uses `/etc/network/interfaces` too. If
+NetworkManager were installed, it would fight Proxmox for control of the
+interfaces. It is not installed. One conflict avoided for free.
+
+## 2. The hard constraint: you cannot bridge Wi-Fi
+
+This decides the design. It is not a preference.
+
+A bridge is a switch in software. A switch forwards a frame based on the sender
+and receiver hardware addresses it reads in that frame. An Ethernet frame holds
+two addresses, and that is enough.
+
+A Wi-Fi frame in client mode holds **three** addresses: sender, receiver, and
+the access point. To carry traffic for a machine behind it, the client needs a
+**fourth** address field. That mode is called 4-address mode. Most client
+drivers do not have it, and most access points refuse it.
+
+```
+Ethernet frame            Wi-Fi client frame (3 addresses)
++-----+-----+------+      +-----+-----+-----+------+
+| dst | src | data |      | AP  | src | dst | data |
++-----+-----+------+      +-----+-----+-----+------+
+   a bridge can               no room for "and this frame
+   forward this               is really for the VM behind me"
+```
+
+The driver on arrakis says what it supports:
+
+```
+$ iw phy phy0 info
+    Supported interface modes:
+         * IBSS
+         * managed
+```
+
+`managed` means "client". There is no `AP` mode and no 4-address mode.
+
+The card is a **Qualcomm Atheros QCA9377** on the `ath10k_pci` driver, with
+firmware from the Debian package `firmware-atheros`. (An earlier note in this
+repository said Intel/`iwlwifi`. That was wrong and is corrected here. The
+conclusion does not change: the `iw phy` output above is the measurement that
+settles it, and `ath10k` has no 4-address mode in client mode either.)
+
+**Result: `vmbr0` must NOT be bridged to `wlp3s0`. It will not work.**
+
+### What to do instead: NAT
+
+Give the VMs a private network of their own. The host rewrites their addresses
+on the way out.
+
+```
+   VM mentat   10.10.10.11 --+
+   VM windtrap 10.10.10.12 --+--> vmbr0 --> NAT --> wlp3s0 --> router
+   VM sietch-1 10.10.10.13 --+     (host is      (rewrite      192.168.1.21
+                                    10.10.10.1)   the sender)
+```
+
+`vmbr0` here is a bridge with **no physical port attached**. It only joins the
+VMs to each other and to the host. The host then forwards and rewrites.
+
+Everyday comparison: an office with one phone line. Each desk has an extension.
+The switchboard places every outgoing call on the one line and remembers which
+extension made it, so the answer comes back to the right desk.
+
+Cost of NAT: the VMs can start a connection outward. Nothing on your LAN can
+start a connection inward to a VM without a forwarding rule you add by hand.
+
+### Rejected: the Ethernet port
+
+`enp2s0` exists but the port does not work (confirmed by the user, 2026-11-08).
+Ethernet would have allowed a real bridge, like this:
+
+```
+   VM mentat --+
+   VM windtrap -+--> vmbr0 (bridged to enp2s0) --> router
+   VM sietch --+
+```
+
+Each VM then gets a real `192.168.1.x` address from your router. No NAT, no
+forwarding rules, and the VMs are reachable from any machine on your LAN. It is
+simpler and faster.
+
+This path is closed. **NAT is the design.** See decision D4 in learning.md.
+
+## 3. Two blockers for Proxmox, both confirmed
+
+### 3.1 The hostname resolves to a loopback address
+
+```
+$ hostname --ip-address
+127.0.1.1
+```
+
+The Proxmox install page says: "The hostname of your machine must be resolvable
+to an IP address. This IP address must not be a loopback one like 127.0.0.1."
+
+Cause, in `/etc/hosts`:
+
+```
+127.0.0.1    localhost
+127.0.1.1    arrakis.home.arpa    arrakis
+```
+
+Line 2 is the Debian default. It must change to the real address.
+
+```
+127.0.0.1       localhost
+192.168.1.21    arrakis.home.arpa    arrakis
+```
+
+Warning: `192.168.1.21` comes from DHCP. A DHCP address can change. Before this
+edit, either reserve the address in the router, or give `wlp3s0` a static
+address in `/etc/network/interfaces`. Do not write a changing address into
+`/etc/hosts`.
+
+### 3.2 Tailscale owns DNS, and Proxmox wants to own DNS
+
+```
+$ readlink -f /etc/resolv.conf
+/etc/resolv.conf
+$ head -3 /etc/resolv.conf
+# resolv.conf(5) file generated by tailscale
+# DO NOT EDIT THIS FILE BY HAND -- CHANGES WILL BE OVERWRITTEN
+nameserver 100.100.100.100
+```
+
+Tailscale replaces the file. The Proxmox page says: "The Proxmox VE GUI expects
+to control DNS management and will no longer take its DNS settings from
+/etc/network/interfaces."
+
+Two programs that both rewrite one file will fight. The symptom is DNS that
+works until one of them next writes, then stops.
+
+The fix, in order of preference:
+
+1. `tailscale set --accept-dns=false`. Tailscale then stops writing the file.
+   You lose MagicDNS short names such as `arrakis`. You keep the addresses.
+2. Let Tailscale keep DNS, and never set DNS in the Proxmox GUI.
+
+Test option 1 **before** the Proxmox install, not after. If it breaks your SSH
+name resolution you want to find out while you can still log in.
+
+## 4. The danger: do not lock yourself out
+
+Every change in this directory touches the one path you use to reach arrakis.
+A wrong line in `/etc/network/interfaces` and the machine comes back with no
+network. It is a laptop in another room. You then need a keyboard and a screen.
+
+Rules for any network change:
+
+1. Keep a copy first: `cp /etc/network/interfaces /root/interfaces.bak`
+2. Make the change, but do not restart networking.
+3. Set a timer that undoes it if you do not cancel:
+   `sudo shutdown -r +10` before a risky `ifreload`. Cancel with
+   `sudo shutdown -c` once you confirm you are still connected.
+4. Never restart networking and the Wi-Fi at the same time.
+5. Have physical access ready for the Proxmox install itself. The install
+   replaces the kernel and reboots.
+
+## 5. Secrets: never commit the Wi-Fi password
+
+`/etc/network/interfaces` is mode 0600 and readable only by root, because it
+holds the Wi-Fi pre-shared key.
+
+Do not copy that file into this repository. Store the shape of the config here,
+with the key replaced by a placeholder. The real key stays on the machine.
+
+## 6. Work items
+
+| Item | Work | Status |
+|---|---|---|
+| N1 | Decide cable or Wi-Fi. Section 2. | **Done 2026-11-08: Wi-Fi + NAT. The Ethernet port does not work.** |
+| N2 | Reserve or set a static address for arrakis | Not started |
+| N3 | Fix the loopback hostname in `/etc/hosts`. Section 3.1 | Not started |
+| N4 | Test `tailscale set --accept-dns=false`. Section 3.2 | Not started |
+| N5 | Capture the sanitised `/etc/network/interfaces` here | Needs sudo |
+| N6 | Write the `vmbr0` plus NAT config | **Unblocked. This is the next job.** |
