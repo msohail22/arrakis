@@ -1,33 +1,51 @@
 # windtrap: the database VM. PostgreSQL and Redis will live here.
 #
-# 2 GB, not 3 GB like mentat. A database node needs less than a Kubernetes node.
-# Measured on 2026-11-08: a 3 GB VM held only 1023 MB of real host memory,
-# because QEMU hands memory over lazily. So this is a ceiling, not a cost.
+# This provider (v0.9.9) follows libvirt's own domain XML schema closely, so the
+# configuration is verbose and uses attribute syntax (`= { }`), not blocks.
+# Every field here was taken from the provider's own docs, not from convention:
+#   docs/resources/{domain,volume,cloudinit_disk}.md in dmacvicar/terraform-provider-libvirt
+#
+# Sizing: 2 GB, against mentat's 3 GB. A database node needs less than a
+# Kubernetes node. Measured 2026-11-08: a 3 GB VM held only 1023 MB of real host
+# memory, because QEMU hands memory over lazily. So this is a ceiling, not a cost.
 
 locals {
   windtrap = {
     name   = "windtrap"
-    memory = 2048
+    memory = 2048                          # MiB
     vcpu   = 2
-    disk   = 20 * 1024 * 1024 * 1024 # 20 GiB, in bytes
-    mac    = "52:54:00:10:10:12"     # pinned in arrakis-nat.xml -> 10.10.10.12
-    ip     = "10.10.10.12"
+    disk   = 20 * 1024 * 1024 * 1024       # 20 GiB in bytes
+    mac    = "52:54:00:10:10:12"           # pinned in arrakis-nat.xml -> 10.10.10.12
   }
 }
 
-# The disk. Copied from the base image, so the base stays pristine.
+# The disk. backing_store points at the Debian cloud image, so this volume is a
+# copy-on-write overlay: it starts near zero bytes and only stores what changes.
+# The base image is never written to, so it stays reusable for sietch.
 resource "libvirt_volume" "windtrap" {
-  name           = "${local.windtrap.name}.qcow2"
-  pool           = var.image_pool
-  base_volume_id = var.base_image
-  size           = local.windtrap.disk
-  format         = "qcow2"
+  name     = "${local.windtrap.name}.qcow2"
+  pool     = var.image_pool
+  capacity = local.windtrap.disk
+
+  target = {
+    format = { type = "qcow2" }
+  }
+
+  backing_store = {
+    path   = var.base_image
+    format = { type = "qcow2" }
+  }
 }
 
-# The cloud-init configuration disk. This replaces cloud-localds.
+# The cloud-init configuration disk. This is what cloud-localds built by hand.
+#
+# IMPORTANT: this resource builds the ISO on the MACHINE RUNNING TOFU (the PC),
+# and its `path` is a local temporary file. arrakis cannot see it. Attaching
+# that path directly fails with:
+#   Cannot access storage file '/tmp/terraform-provider-libvirt-cloudinit/...'
+# So it is uploaded into the pool as a volume below, and the VM uses that.
 resource "libvirt_cloudinit_disk" "windtrap" {
   name = "${local.windtrap.name}-seed.iso"
-  pool = var.image_pool
 
   user_data = <<-EOT
     #cloud-config
@@ -48,45 +66,117 @@ ${join("\n", [for k in var.ssh_public_keys : "          - ${k}"])}
   EOT
 }
 
-resource "libvirt_domain" "windtrap" {
-  name   = local.windtrap.name
-  memory = local.windtrap.memory
-  vcpu   = local.windtrap.vcpu
+# Uploads the locally-built ISO into the pool on arrakis. `create.content.url`
+# accepts a local path as well as an http URL. This is the bridge between "built
+# on the PC" and "readable by QEMU on arrakis".
+resource "libvirt_volume" "windtrap_seed" {
+  name = "${local.windtrap.name}-seed.iso"
+  pool = var.image_pool
 
-  # The flag that cost four attempts on mentat. Debian's cloud image needs UEFI;
-  # virt-install and this provider both default to BIOS, which gives a silent
-  # boot loop. See learning.md Q14.
-  firmware = "/usr/share/OVMF/OVMF_CODE_4M.fd"
-
-  nvram {
-    file = "/var/lib/libvirt/qemu/nvram/${local.windtrap.name}_VARS.fd"
+  target = {
+    format = { type = "iso" }   # the provider detects iso and reports it back; declaring raw fails the consistency check
   }
 
-  cpu { mode = "host-passthrough" }
-
-  disk { volume_id = libvirt_volume.windtrap.id }
-  disk { volume_id = libvirt_cloudinit_disk.windtrap.id }
-
-  network_interface {
-    network_name = var.network_name
-    mac          = local.windtrap.mac
-    wait_for_lease = true
+  create = {
+    content = {
+      url = libvirt_cloudinit_disk.windtrap.path
+    }
   }
-
-  # A serial console, so `virsh console windtrap` works. Without this there is
-  # no way to watch a failed boot.
-  console {
-    type        = "pty"
-    target_port = "0"
-    target_type = "serial"
-  }
-
-  graphics { type = "none" }
-
-  autostart = true
 }
 
-output "windtrap_ip" {
-  description = "Should be 10.10.10.12, from the pinned MAC."
-  value       = try(libvirt_domain.windtrap.network_interface[0].addresses[0], "pending")
+resource "libvirt_domain" "windtrap" {
+  name        = local.windtrap.name
+  type        = "kvm"
+  memory      = local.windtrap.memory
+  memory_unit = "MiB"
+  vcpu        = local.windtrap.vcpu
+
+  running   = true
+  autostart = true # decision D16: mentat was missed and stayed off after a reboot
+
+  cpu = {
+    mode = "host-passthrough"
+  }
+
+  # UEFI refuses to start without ACPI: "unsupported configuration: UEFI
+  # requires ACPI on this architecture". virt-install adds these silently; this
+  # provider does not. apic is added for the same reason - an x86 guest needs an
+  # interrupt controller.
+  features = {
+    acpi = true
+    apic = {}
+  }
+
+  # UEFI. Without this the VM boot-loops in silence: `virsh list` says running
+  # while nothing works, and the QEMU log shows no error. Debian's cloud image
+  # expects UEFI; the default is BIOS. See learning.md Q14.
+  # Paths verified on arrakis with `ls /usr/share/OVMF/`.
+  os = {
+    type            = "hvm"
+    type_arch       = "x86_64"
+    type_machine    = "q35"
+    firmware        = "efi"
+    loader          = "/usr/share/OVMF/OVMF_CODE_4M.fd"
+    loader_readonly = "yes"   # String, not boolean: libvirt XML wants yes/no
+    loader_type     = "pflash"
+    nv_ram = {
+      nv_ram   = "/var/lib/libvirt/qemu/nvram/${local.windtrap.name}_VARS.fd"
+      template = "/usr/share/OVMF/OVMF_VARS_4M.fd"
+    }
+    boot_devices    = [{ dev = "hd" }]
+  }
+
+  devices = {
+    disks = [
+      {
+        # driver.type MUST be stated. The provider defaults to "raw", so QEMU
+        # reads the qcow2 file as raw bytes: the guest then sees qcow2 header
+        # metadata where the partition table should be, UEFI finds no
+        # filesystem, and it drops to its own shell. The console log showed
+        # "BLK0" with no "FS0:" alias. Found by diffing this XML against
+        # mentat's working one. See learning.md Q25.
+        driver = { name = "qemu", type = "qcow2" }
+        source = { file = { file = libvirt_volume.windtrap.path } }
+        target = { dev = "vda", bus = "virtio" }
+      },
+      {
+        device    = "cdrom"
+        read_only = true
+        driver    = { name = "qemu", type = "raw" } # an ISO really is raw
+        source    = { file = { file = libvirt_volume.windtrap_seed.path } }
+        target    = { dev = "sda", bus = "sata" }
+      },
+    ]
+
+    interfaces = [
+      {
+        model  = { type = "virtio" }
+        mac    = { address = local.windtrap.mac }
+        source = { network = { network = var.network_name } }
+      },
+    ]
+
+    # A serial console, so `virsh console windtrap` works. Without it there is no
+    # way to watch a failed boot, which is how Q14 was solved.
+    #
+    # `log` writes everything the console prints to a file on arrakis as well.
+    # `virsh console` needs a controlling terminal, which a script does not have,
+    # so without this a failed boot can only be diagnosed by a human sitting at a
+    # prompt. The log file can be read by anything.
+    consoles = [
+      {
+        target = { type = "serial", port = 0 }
+        log    = { file = "/var/log/libvirt/qemu/${local.windtrap.name}-console.log", append = "on" }
+      },
+    ]
+  }
+}
+
+output "windtrap_disk_path" {
+  value = libvirt_volume.windtrap.path
+}
+
+output "windtrap_expected_ip" {
+  description = "From the pinned MAC in arrakis-nat.xml."
+  value       = "10.10.10.12"
 }

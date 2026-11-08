@@ -28,7 +28,8 @@
       <range start='10.10.10.100' end='10.10.10.200'/>
       <host mac='52:54:00:10:10:11' name='mentat'  ip='10.10.10.11'/>
       <host mac='52:54:00:10:10:12' name='windtrap' ip='10.10.10.12'/>
-      <host mac='52:54:00:10:10:13' name='sietch-1' ip='10.10.10.13'/>
+      <host mac='52:54:00:10:10:13' name='sietch' ip='10.10.10.13'/>
+      <host mac='52:54:00:10:10:14' name='shieldwall' ip='10.10.10.14'/>
     </dhcp>
   </ip>
 </network>

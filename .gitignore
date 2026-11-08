@@ -7,3 +7,6 @@ tofu/*.tfstate.*
 tofu/terraform.tfvars
 tofu/*.tfvars.json
 crash.log
+# kubeconfig holds client certificates
+*.kubeconfig
+kubeconfig*

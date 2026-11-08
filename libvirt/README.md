@@ -45,7 +45,7 @@ the machine will drift apart.
 10.10.10.1              arrakis itself, on the virtual switch
 10.10.10.11  mentat     the Kubernetes node
 10.10.10.12  windtrap   PostgreSQL, Redis
-10.10.10.13  sietch-1   a second node, later
+10.10.10.13  sietch   a second node, later
 10.10.10.100-200        pool for temporary VMs
 ```
 
@@ -57,7 +57,7 @@ The `52:54:00` prefix is the range reserved for QEMU.
 ```
    mentat   10.10.10.11 --+
    windtrap 10.10.10.12 --+--> virbr-arrakis --> NAT --> wlp3s0 --> router
-   sietch-1 10.10.10.13 --+    (software switch)  (rewrite  192.168.1.21
+   sietch 10.10.10.13 --+    (software switch)  (rewrite  192.168.1.21
                                10.10.10.1          sender)
 ```
 

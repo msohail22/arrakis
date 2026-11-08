@@ -72,7 +72,7 @@ on the way out.
 ```
    VM mentat   10.10.10.11 --+
    VM windtrap 10.10.10.12 --+--> vmbr0 --> NAT --> wlp3s0 --> router
-   VM sietch-1 10.10.10.13 --+     (host is      (rewrite      192.168.1.21
+   VM sietch 10.10.10.13 --+     (host is      (rewrite      192.168.1.21
                                     10.10.10.1)   the sender)
 ```
 

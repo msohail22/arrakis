@@ -182,7 +182,7 @@ cat > /tmp/arrakis-nat.xml <<'EOF'
       <range start='10.10.10.100' end='10.10.10.200'/>
       <host mac='52:54:00:10:10:11' name='mentat'   ip='10.10.10.11'/>
       <host mac='52:54:00:10:10:12' name='windtrap' ip='10.10.10.12'/>
-      <host mac='52:54:00:10:10:13' name='sietch-1' ip='10.10.10.13'/>
+      <host mac='52:54:00:10:10:13' name='sietch' ip='10.10.10.13'/>
     </dhcp>
   </ip>
 </network>
@@ -299,7 +299,7 @@ virt-install \
   --disk /var/lib/libvirt/images/mentat-seed.iso,device=cdrom \
   --network network=arrakis-nat,mac=52:54:00:10:10:11 \
   --os-variant debian13 \
-  --import --graphics none --noautoconsole
+  --import --graphics none --noautoconsole --autostart
 ```
 
 ### `--boot uefi` is mandatory
